@@ -1,0 +1,90 @@
+#!/bin/sh
+# Starts DaVinci Resolve with the environment it needs to behave on Linux.
+# Settings come from the environment or from ~/.config/resolve-linux-fix/config.
+
+config="${XDG_CONFIG_HOME:-$HOME/.config}/resolve-linux-fix/config"
+[ -r "$config" ] && . "$config"
+
+RESOLVE_DIR="${RESOLVE_DIR:-/opt/resolve}"
+RESOLVE_LOCALE="${RESOLVE_LOCALE:-en_US.UTF-8}"
+RESOLVE_NVIDIA_OFFLOAD="${RESOLVE_NVIDIA_OFFLOAD:-auto}"
+RESOLVE_NATIVE_FILE_DIALOG="${RESOLVE_NATIVE_FILE_DIALOG:-yes}"
+RESOLVE_UI_SCALE="${RESOLVE_UI_SCALE:-auto}"
+RESOLVE_AUDIO_FIX="${RESOLVE_AUDIO_FIX:-yes}"
+
+data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/resolve-linux-fix"
+bin_dir="$(dirname "$0")"
+
+# Fusion looks up this locale when handling key presses and aborts if it does not exist.
+# A locale with a decimal comma also breaks the shaders behind the 3D titles, so the
+# whole application runs under an English locale. The interface language is unaffected.
+export LANG="$RESOLVE_LOCALE"
+unset LC_ALL LC_NUMERIC LOCPATH
+
+# On hybrid laptops OpenGL has to run on the NVIDIA GPU.
+use_nvidia=no
+case "$RESOLVE_NVIDIA_OFFLOAD" in
+  yes) use_nvidia=yes ;;
+  auto)
+    if [ -d /proc/driver/nvidia ]; then
+      for vendor in /sys/class/drm/card[0-9]*/device/vendor; do
+        [ -r "$vendor" ] || continue
+        [ "$(cat "$vendor")" != "0x10de" ] && use_nvidia=yes
+      done
+    fi
+    ;;
+esac
+if [ "$use_nvidia" = yes ]; then
+  export __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia
+fi
+
+# Resolve ships a Qt build without any platform theme plugin, so it falls back to its own
+# file browser. Loading the system GTK theme plugin from a private directory gives it the
+# regular file chooser without exposing the rest of the system Qt plugins.
+if [ "$RESOLVE_NATIVE_FILE_DIALOG" = yes ] && [ -e "$data_dir/qt-plugins/platformthemes/libqgtk3.so" ]; then
+  export QT_PLUGIN_PATH="$data_dir/qt-plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+  export QT_QPA_PLATFORMTHEME=gtk3
+fi
+
+# Resolve only ships the xcb Qt platform plugin. A session that exports QT_QPA_PLATFORM=wayland
+# would stop it from starting, so it always runs through XWayland or plain X11.
+export QT_QPA_PLATFORM=xcb
+
+# Wlroots based compositors such as Hyprland and Sway run XWayland at scale 1, which leaves
+# Resolve tiny on HiDPI screens. Qt can scale the interface itself, but only for the output
+# that is focused when Resolve starts. GNOME and KDE scale XWayland clients on their own, and
+# plain X11 sessions have nothing to scale, so nothing is changed there.
+scale=""
+case "$RESOLVE_UI_SCALE" in
+  off|no|1|1.0) ;;
+  auto)
+    if [ "${XDG_CURRENT_DESKTOP:-}" = "Hyprland" ] && command -v hyprctl >/dev/null 2>&1; then
+      scale=$(hyprctl -j monitors 2>/dev/null | python3 -c 'import json, sys
+focused = [m for m in json.load(sys.stdin) if m.get("focused")]
+print(focused[0]["scale"] if focused else 1)' 2>/dev/null)
+    elif [ -n "${SWAYSOCK:-}" ] && command -v swaymsg >/dev/null 2>&1; then
+      scale=$(swaymsg -t get_outputs -r 2>/dev/null | python3 -c 'import json, sys
+focused = [o for o in json.load(sys.stdin) if o.get("focused")]
+print(focused[0]["scale"] if focused else 1)' 2>/dev/null)
+    fi
+    ;;
+  *) scale="$RESOLVE_UI_SCALE" ;;
+esac
+case "$scale" in
+  ""|1|1.0|1.00) ;;
+  *) export QT_ENABLE_HIGHDPI_SCALING=1 QT_SCALE_FACTOR="$scale" ;;
+esac
+
+if [ "${1:-}" = "--print-env" ]; then
+  echo "desktop=${XDG_CURRENT_DESKTOP:-unknown} session=${XDG_SESSION_TYPE:-unknown}"
+  env | grep -E '^(LANG|QT_QPA_PLATFORM|QT_QPA_PLATFORMTHEME|QT_PLUGIN_PATH|QT_SCALE_FACTOR|QT_ENABLE_HIGHDPI_SCALING|__NV_PRIME_RENDER_OFFLOAD|__GLX_VENDOR_LIBRARY_NAME)=' | sort
+  exit 0
+fi
+
+if [ "$RESOLVE_AUDIO_FIX" = yes ] && [ -x "$bin_dir/resolve-audio-fix" ]; then
+  if ! pgrep -f "resolve-audio-fix --exit-when-closed" >/dev/null 2>&1; then
+    setsid "$bin_dir/resolve-audio-fix" --exit-when-closed >/dev/null 2>&1 &
+  fi
+fi
+
+exec "$RESOLVE_DIR/bin/resolve" "$@"

@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Keeps AAC audio working in DaVinci Resolve on Linux.
+
+Resolve on Linux cannot decode AAC, which is the audio codec used by practically every
+phone and camera MP4. This helper watches Resolve's own log. When Resolve fails to decode
+audio, or when the file chooser has been used, it makes a single pass over the media pool
+through the scripting API. Every clip with AAC audio gets a remuxed copy (video stream copied
+untouched, audio converted to PCM) and the clip in the media pool is swapped for that copy,
+so bins and timelines keep working. The original file is never modified.
+
+Notifications are only sent when something goes wrong, unless NOTIFY=all is set in the config.
+"""
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+CONFIG_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                           "resolve-linux-fix", "config")
+
+
+def read_config(path):
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return values
+
+
+CONFIG = read_config(CONFIG_FILE)
+
+
+def setting(name, default):
+    return os.environ.get(name) or CONFIG.get(name) or default
+
+
+RESOLVE_DIR = setting("RESOLVE_DIR", "/opt/resolve")
+RESOLVE_BIN = os.path.join(RESOLVE_DIR, "bin", "resolve")
+SCRIPT_API = os.path.join(RESOLVE_DIR, "Developer", "Scripting")
+SCRIPT_LIB = os.path.join(RESOLVE_DIR, "libs", "Fusion", "fusionscript.so")
+NOTIFY_MODE = setting("NOTIFY", "errors")
+MIN_FREE_MARGIN = int(float(setting("MIN_FREE_GB", "3")) * 1024 ** 3)
+MIN_SWEEP_GAP = 3.0
+
+STATE_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+                         "resolve-linux-fix")
+LOG_FILE = os.path.join(STATE_DIR, "audio-fix.log")
+STATE_FILE = os.path.join(STATE_DIR, "audio-fix-state.json")
+RESOLVE_LOG = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+                           "DaVinciResolve", "logs", "ResolveDebug.txt")
+
+os.makedirs(STATE_DIR, exist_ok=True)
+
+
+def default_output_dir():
+    try:
+        videos = subprocess.run(["xdg-user-dir", "VIDEOS"], capture_output=True, text=True).stdout.strip()
+    except Exception:
+        videos = ""
+    return os.path.join(videos or os.path.expanduser("~/Videos"), "Resolve audio converted")
+
+
+OUT_DIR = os.path.expanduser(setting("OUTPUT_DIR", default_output_dir()))
+
+
+def log(message):
+    line = time.strftime("[%F %T] ") + message
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        if os.path.getsize(LOG_FILE) > 2_000_000:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
+    except OSError:
+        pass
+
+
+def notify(title, body, icon="dialog-error", is_error=True):
+    if NOTIFY_MODE == "none" or (NOTIFY_MODE == "errors" and not is_error):
+        return
+    try:
+        subprocess.run(["notify-send", "-a", "Resolve audio fix", "-i", icon, title, body], timeout=5)
+    except Exception:
+        pass
+
+
+def resolve_running():
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as handle:
+                    argv0 = handle.read().split(b"\0")[0].decode(errors="ignore")
+            except OSError:
+                continue
+            if argv0 == RESOLVE_BIN:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def connect():
+    sys.path.append(os.path.join(SCRIPT_API, "Modules"))
+    os.environ.setdefault("RESOLVE_SCRIPT_API", SCRIPT_API)
+    os.environ.setdefault("RESOLVE_SCRIPT_LIB", SCRIPT_LIB)
+    import DaVinciResolveScript as dvr
+    return dvr.scriptapp("Resolve")
+
+
+def walk_clips(folder):
+    for clip in folder.GetClipList() or []:
+        yield clip
+    for sub in folder.GetSubFolderList() or []:
+        yield from walk_clips(sub)
+
+
+def probe(path):
+    result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=index,codec_type,codec_name",
+                             "-of", "json", path], capture_output=True, text=True)
+    try:
+        return json.loads(result.stdout).get("streams", [])
+    except Exception:
+        return []
+
+
+def convert(path):
+    streams = probe(path)
+    video_codec = next((s.get("codec_name") for s in streams
+                        if s.get("codec_type") == "video" and s.get("codec_name") not in ("mjpeg", "png")), None)
+    has_video = video_codec is not None
+    info = os.stat(path)
+    key = hashlib.sha1(f"{path}|{info.st_size}|{int(info.st_mtime)}".encode()).hexdigest()[:8]
+    stem = os.path.splitext(os.path.basename(path))[0]
+    os.makedirs(OUT_DIR, exist_ok=True)
+    extension = "mov" if has_video else "wav"
+    out = os.path.join(OUT_DIR, f"{stem}_{key}.{extension}")
+    if os.path.exists(out):
+        return out
+    free = shutil.disk_usage(OUT_DIR).free
+    needed = info.st_size * 1.1 + MIN_FREE_MARGIN
+    if free < needed:
+        raise RuntimeError(f"not enough free space ({free / 1e9:.1f} GB) to convert {info.st_size / 1e9:.1f} GB")
+    partial = out + ".part." + extension
+    cmd = ["ffmpeg", "-nostdin", "-y", "-v", "error", "-i", path]
+    if has_video:
+        cmd += ["-map", "0:v:0", "-map", "0:a?", "-c:v", "copy"]
+        if video_codec == "hevc":
+            cmd += ["-tag:v", "hvc1"]
+        cmd += ["-c:a", "pcm_s24le", "-ar", "48000", "-dn", "-sn", "-movflags", "+faststart", "-f", "mov", partial]
+    else:
+        cmd += ["-vn", "-c:a", "pcm_s24le", "-ar", "48000", "-f", "wav", partial]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.exists(partial):
+        if os.path.exists(partial):
+            os.remove(partial)
+        raise RuntimeError("ffmpeg failed: " + (result.stderr.strip().splitlines() or ["unknown error"])[-1])
+    os.replace(partial, out)
+    return out
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return {"failed": {}}
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+    except OSError:
+        pass
+
+
+class Sweeper:
+    """One pass over the media pool, replacing every clip that has AAC audio."""
+
+    def __init__(self):
+        self.resolve = None
+        self.state = load_state()
+        self.checked = set()
+
+    def reset(self):
+        self.resolve = None
+        self.checked.clear()
+
+    def sweep(self):
+        """Returns True when something should be retried shortly."""
+        if self.resolve is None:
+            self.resolve = connect()
+            if self.resolve is None:
+                return True
+            log("connected to Resolve " + str(self.resolve.GetVersionString()))
+        project = self.resolve.GetProjectManager().GetCurrentProject()
+        if not project:
+            return True
+        project_name = project.GetName()
+        root = project.GetMediaPool().GetRootFolder()
+        retry = False
+        for clip in walk_clips(root):
+            key = (project_name, clip.GetUniqueId())
+            if key in self.checked:
+                continue
+            path = clip.GetClipProperty("File Path")
+            if not clip.GetClipProperty("Type"):
+                retry = True
+                continue
+            if not path or not os.path.isfile(path) or path.startswith(OUT_DIR):
+                self.checked.add(key)
+                continue
+            audio_codec = clip.GetClipProperty("Audio Codec") or ""
+            if not audio_codec.upper().startswith("AAC") or self.state["failed"].get(path):
+                self.checked.add(key)
+                continue
+            name = os.path.basename(path)
+            log(f"AAC audio found: {path}")
+            notify("Fixing audio", f"{name}: converting the audio for Resolve", "video-x-generic", is_error=False)
+            try:
+                started = time.time()
+                out = convert(path)
+                replaced = clip.ReplaceClip(out)
+                new_codec = clip.GetClipProperty("Audio Codec") or ""
+                log(f"converted in {time.time() - started:.1f}s -> {out} ReplaceClip={replaced} audio={new_codec!r}")
+                if replaced:
+                    notify("Audio ready", f"{name} now has sound in Resolve.", "video-x-generic", is_error=False)
+                else:
+                    self.state["failed"][path] = "ReplaceClip failed"
+                    save_state(self.state)
+                    notify("Could not replace the clip", f"{name}: use the converted file in {OUT_DIR}", "dialog-warning")
+            except Exception as error:
+                self.state["failed"][path] = str(error)
+                save_state(self.state)
+                log(f"error with {path}: {error}")
+                notify("Could not fix the audio", f"{name}: {error}")
+            self.checked.add(key)
+        return retry
+
+
+class LogTail:
+    """Follows Resolve's log file, which is recreated on every start."""
+
+    def __init__(self, path):
+        self.path, self.handle, self.inode, self.buffer = path, None, None, ""
+
+    def close(self):
+        if self.handle:
+            self.handle.close()
+        self.handle = self.inode = None
+
+    def lines(self):
+        try:
+            info = os.stat(self.path)
+        except OSError:
+            self.close()
+            return []
+        if self.handle is None or info.st_ino != self.inode or info.st_size < self.handle.tell():
+            self.close()
+            self.handle = open(self.path, "r", encoding="utf-8", errors="replace")
+            self.inode = info.st_ino
+            self.handle.seek(0, os.SEEK_END)
+        data = self.handle.read()
+        if not data:
+            return []
+        self.buffer += data
+        *complete, self.buffer = self.buffer.split("\n")
+        return complete
+
+
+def main():
+    exit_when_closed = "--exit-when-closed" in sys.argv
+    started = time.time()
+    log("started" + (" (exits when Resolve closes)" if exit_when_closed else ""))
+    sweeper, tail = Sweeper(), LogTail(RESOLVE_LOG)
+    due = None
+    last_sweep = 0.0
+    was_running = False
+    while True:
+        try:
+            if not resolve_running():
+                if was_running:
+                    log("Resolve closed")
+                if exit_when_closed and (was_running or time.time() - started > 120):
+                    log("exiting")
+                    return
+                was_running, due = False, None
+                sweeper.reset()
+                tail.close()
+                time.sleep(3)
+                continue
+            if not was_running:
+                was_running = True
+                tail.close()
+            for line in tail.lines():
+                if "Failed to decode clip" in line and "audio" in line:
+                    due = min(due, time.time() + 1.0) if due else time.time() + 1.0
+                elif "Cannot stat entry" in line:
+                    due = min(due, time.time() + 5.0) if due else time.time() + 5.0
+            if due and time.time() >= due and time.time() - last_sweep >= MIN_SWEEP_GAP:
+                due = None
+                last_sweep = time.time()
+                if sweeper.sweep():
+                    due = time.time() + 4.0
+        except Exception:
+            log("unexpected error: " + traceback.format_exc().strip().splitlines()[-1])
+            sweeper.resolve = None
+            due = time.time() + 6.0
+        time.sleep(0.5)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,31 @@
+# Settings for the DaVinci Resolve Linux fix.
+# Copy this file to ~/.config/resolve-linux-fix/config and uncomment what you want to change.
+# Every value shown here is the default.
+
+# Where Resolve is installed.
+#RESOLVE_DIR=/opt/resolve
+
+# Locale used while Resolve runs. It has to exist on the system (see locale -a).
+#RESOLVE_LOCALE=en_US.UTF-8
+
+# auto enables NVIDIA offload on hybrid GPU laptops, yes forces it, no disables it.
+#RESOLVE_NVIDIA_OFFLOAD=auto
+
+# yes uses the system GTK file chooser instead of Resolve's own file browser.
+#RESOLVE_NATIVE_FILE_DIALOG=yes
+
+# auto scales the interface on Hyprland and Sway using the focused output.
+# Use a number such as 1.5 to force a factor, or off to leave Resolve alone.
+#RESOLVE_UI_SCALE=auto
+
+# yes starts the AAC audio helper together with Resolve.
+#RESOLVE_AUDIO_FIX=yes
+
+# Notifications from the audio helper: errors, all or none.
+#NOTIFY=errors
+
+# Where converted copies of clips are written.
+#OUTPUT_DIR=$HOME/Videos/Resolve audio converted
+
+# Conversions are skipped when less than this many GB would stay free.
+#MIN_FREE_GB=3

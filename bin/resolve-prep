@@ -1,0 +1,42 @@
+#!/bin/sh
+# Converts videos so that DaVinci Resolve on Linux can play their audio.
+# The video stream is copied as it is and only the audio is converted to PCM.
+# Usage: resolve-prep [-o output_dir] file [file ...]
+# Each file produces name_resolve.mov next to the original, or inside output_dir.
+
+out=""
+if [ "$1" = "-o" ]; then
+  out="$2"
+  shift 2
+fi
+
+if [ "$#" -eq 0 ]; then
+  echo "Usage: resolve-prep [-o output_dir] file [file ...]" >&2
+  exit 1
+fi
+
+for tool in ffmpeg ffprobe; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "$tool is required but not installed" >&2; exit 1; }
+done
+
+for file in "$@"; do
+  if [ ! -f "$file" ]; then
+    echo "Not found: $file" >&2
+    continue
+  fi
+  dir="${out:-$(dirname "$file")}"
+  mkdir -p "$dir"
+  base="$(basename "${file%.*}")"
+  dest="$dir/${base}_resolve.mov"
+  if [ -e "$dest" ]; then
+    echo "Already exists, skipping: $dest"
+    continue
+  fi
+  codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$file")
+  tag=""
+  [ "$codec" = "hevc" ] && tag="-tag:v hvc1"
+  echo "Writing $dest"
+  # shellcheck disable=SC2086
+  ffmpeg -nostdin -v error -stats -i "$file" -map 0:v:0 -map '0:a?' -c:v copy $tag \
+    -c:a pcm_s24le -ar 48000 -movflags +faststart "$dest" || echo "Failed: $file" >&2
+done

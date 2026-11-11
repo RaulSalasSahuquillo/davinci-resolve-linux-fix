@@ -1,0 +1,62 @@
+#!/bin/sh
+# Prints the state of every piece of the DaVinci Resolve Linux fix.
+
+config="${XDG_CONFIG_HOME:-$HOME/.config}/resolve-linux-fix/config"
+[ -r "$config" ] && . "$config"
+RESOLVE_DIR="${RESOLVE_DIR:-/opt/resolve}"
+RESOLVE_LOCALE="${RESOLVE_LOCALE:-en_US.UTF-8}"
+data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/resolve-linux-fix"
+
+status() {
+  printf '%-34s %s\n' "$1" "$2"
+}
+
+status "Desktop session" "${XDG_CURRENT_DESKTOP:-unknown} (${XDG_SESSION_TYPE:-unknown})"
+if [ -x "$(dirname "$0")/resolve-launch" ]; then
+  scale=$("$(dirname "$0")/resolve-launch" --print-env 2>/dev/null | sed -n 's/^QT_SCALE_FACTOR=//p')
+  status "Interface scale" "${scale:-not applied by the launcher}"
+fi
+
+if [ -x "$RESOLVE_DIR/bin/resolve" ]; then
+  status "Resolve binary" "found in $RESOLVE_DIR"
+else
+  status "Resolve binary" "MISSING in $RESOLVE_DIR (install Resolve from blackmagicdesign.com or set RESOLVE_DIR in $config)"
+fi
+
+normalized=$(printf '%s' "$RESOLVE_LOCALE" | sed 's/UTF-8/utf8/I')
+if locale -a 2>/dev/null | grep -qix "$normalized"; then
+  status "Locale $RESOLVE_LOCALE" "available"
+else
+  status "Locale $RESOLVE_LOCALE" "MISSING, Resolve will abort on key presses"
+fi
+
+if [ -e "$data_dir/qt-plugins/platformthemes/libqgtk3.so" ]; then
+  status "GTK file chooser plugin" "linked"
+else
+  status "GTK file chooser plugin" "not linked (install the Qt5 GTK platform theme and rerun install.sh)"
+fi
+
+for tool in ffmpeg ffprobe python3 notify-send; do
+  if command -v "$tool" >/dev/null 2>&1; then
+    status "$tool" "found"
+  else
+    status "$tool" "missing"
+  fi
+done
+
+prefs="${XDG_DATA_HOME:-$HOME/.local/share}/DaVinciResolve/configs/config.dat"
+if [ -r "$prefs" ]; then
+  mode=$(sed -n 's/^System.Scripting.Mode *= *//p' "$prefs" | head -n 1)
+  case "$mode" in
+    1|2) status "External scripting" "enabled (mode $mode)" ;;
+    *) status "External scripting" "DISABLED: set Preferences > System > General > External scripting using > Local" ;;
+  esac
+else
+  status "External scripting" "unknown (start Resolve once so it creates its preferences)"
+fi
+
+if pgrep -f "resolve-audio-fix" >/dev/null 2>&1; then
+  status "Audio helper" "running"
+else
+  status "Audio helper" "not running (it starts together with Resolve)"
+fi
